@@ -652,19 +652,14 @@ class XPUWeightOnlyMoEMethod(XPUMoEMethod):
             weight_shape[-1] //= 2
         scale_dtype = "float32"
 
-        # 2.crate tmp tensor
-
-        # weight = paddle.empty(weight_shape, dtype=weight_dtype)
-        # scale = paddle.empty(scale_shape, dtype=scale_dtype)
-
         # 3.quantize weight
         weight_list = []
         weight_scale_list = []
         for expert_id in range(layer.num_local_experts):
             quant_weight, scale = weight_quantize_xpu(
-                getattr(layer, unquantized_weight_name)[expert_id].transpose([1, 0]), self.moe_quant_type, -1, -1
+                getattr(layer, unquantized_weight_name)[expert_id], self.moe_quant_type, -1, -1, "nk", "nk"
             )
-            weight_list.append(quant_weight.transpose([1, 0]))
+            weight_list.append(quant_weight)
             weight_scale_list.append(scale)
         quanted_weight = paddle.stack(weight_list, axis=0)
         quanted_weight_scale = paddle.stack(weight_scale_list, axis=0)

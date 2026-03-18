@@ -92,28 +92,8 @@ class XPUWeightOnlyLinearMethod(WeightOnlyLinearMethod):
                 is_bias=False,
             )
 
-    def _quantize_weight_in_blocks(self, weight: paddle.Tensor) -> tuple[paddle.Tensor, paddle.Tensor]:
-        k, n = weight.shape
-        BLOCK_SIZE = 30720
-
-        quanted_weight_list = []
-        scale_list = []
-
-        for i in range(0, n, BLOCK_SIZE):
-            end_n = min(i + BLOCK_SIZE, n)
-            weight_block = weight[:, i:end_n]
-
-            quanted_weight, scale = weight_quantize_xpu(weight_block, self.quant_config.algo, -1, -1)
-            quanted_weight_list.append(quanted_weight)
-            scale_list.append(scale)
-
-        quanted_weight = paddle.concat(quanted_weight_list, axis=1)
-        weight_scale = paddle.concat(scale_list, axis=0)
-
-        return quanted_weight, weight_scale
-
     def process_loaded_weights(self, layer: nn.Layer, weight: paddle.Tensor) -> None:
-        quanted_weight, weight_scale = self._quantize_weight_in_blocks(weight)
+        quanted_weight, weight_scale = weight_quantize_xpu(weight, self.quant_config.algo, -1, -1)
         layer.weight.set_value(paddle.transpose(quanted_weight, [1, 0]))
         layer.weight_scale.set_value(weight_scale)
 
@@ -121,11 +101,11 @@ class XPUWeightOnlyLinearMethod(WeightOnlyLinearMethod):
         if not self.quant_config.is_checkpoint_bf16:
             return
 
-        quanted_weight, weight_scale = self._quantize_weight_in_blocks(layer.weight)
+        quanted_weight, weight_scale = weight_quantize_xpu(layer.weight, self.quant_config.algo, -1, -1, "kn", "nk")
         free_tensor(layer.weight)
 
         layer.weight = layer.create_parameter(
-            shape=quanted_weight.shape[::-1],
+            shape=quanted_weight.shape,
             dtype="int8",
             is_bias=False,
             default_initializer=paddle.nn.initializer.Constant(0),
@@ -136,5 +116,5 @@ class XPUWeightOnlyLinearMethod(WeightOnlyLinearMethod):
             is_bias=False,
             default_initializer=paddle.nn.initializer.Constant(0),
         )
-        layer.weight.set_value(paddle.transpose(quanted_weight, [1, 0]))
+        layer.weight.set_value(quanted_weight)
         layer.weight_scale.copy_(weight_scale, False)

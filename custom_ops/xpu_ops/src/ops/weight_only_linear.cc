@@ -178,9 +178,6 @@ std::vector<std::vector<int64_t>> WeightOnlyLinearInferShape(
                                     static_cast<int64_t>(1),
                                     std::multiplies<int64_t>());
   int64_t m = x_numel / k;
-  if (weight_dtype == "int4") {
-    n = n * 2;
-  }
   return {{m, n}};
 }
 

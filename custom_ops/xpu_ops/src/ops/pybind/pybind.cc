@@ -676,7 +676,9 @@ void UpdateInputsV1(const paddle::Tensor& stop_flags,
 std::vector<paddle::Tensor> WeightQuantize(const paddle::Tensor& x,
                                            const std::string& algo,
                                            const int32_t arch,
-                                           const int32_t group_size);
+                                           const int32_t group_size,
+                                           const std::string& input_layout,
+                                           const std::string& output_layout);
 
 PYBIND11_MODULE(fastdeploy_ops, m) {
   m.def("adjust_batch",
@@ -1459,6 +1461,8 @@ PYBIND11_MODULE(fastdeploy_ops, m) {
         py::arg("algo"),
         py::arg("arch"),
         py::arg("group_size"),
+        py::arg("input_layout") = "kn",
+        py::arg("output_layout") = "kn",
         "Quantize weights on XPU");
 
   m.def("weight_only_linear_xpu",
