@@ -1576,6 +1576,14 @@ class XPUModelRunner(ModelRunnerBase):
                 return None
 
             # 2. Padding inputs for cuda grph
+            if not is_dummy_run:
+                # logger.info(f"seed: {self.share_inputs['infer_seed']}")
+                paddle.device.xpu.set_debug_level(0)
+                if self.share_inputs["input_ids"][0][0].item() == 1773:
+                    # paddle.device.xpu.set_debug_level(0xB1)
+                    # self.sampling_metadata.need_print = True
+                    self.need_print = True
+                    # pass
 
             model_inputs = {}
             model_inputs["ids_remove_padding"] = self.share_inputs["ids_remove_padding"]
@@ -1588,6 +1596,8 @@ class XPUModelRunner(ModelRunnerBase):
             )
             if self.use_cudagraph:
                 model_output = model_output[: self.real_token_num]
+            # if getattr(self, "need_print", False):
+            #     paddle.device.xpu.set_debug_level(0xB1)
             hidden_states = xpu_process_output(model_output, self.forward_meta, self.share_inputs)
             # 4. Compute logits, Sample
             logits = self.model.compute_logits(hidden_states)

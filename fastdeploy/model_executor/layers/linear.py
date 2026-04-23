@@ -49,9 +49,15 @@ class UnquantizedLinearMethod(QuantMethodBase):
         - weight_loader: a callable or method responsible for loading the weight data
         """
         self.model_format = extra_weight_attrs.get("model_format")
-        self.weight_shape = (
-            layer.weight_shape[::-1] if extra_weight_attrs.get("model_format") == "torch" else layer.weight_shape
-        )
+        # Subclasses (e.g. QKVParallelLinear) may provide a weight_shape that is already
+        # in the final [n, k] layout regardless of model_format. In that case we must
+        # skip the automatic reverse done for torch-format checkpoints.
+        if getattr(layer, "_weight_shape_is_format_agnostic", False):
+            self.weight_shape = layer.weight_shape
+        else:
+            self.weight_shape = (
+                layer.weight_shape[::-1] if extra_weight_attrs.get("model_format") == "torch" else layer.weight_shape
+            )
 
         layer.weight = layer.create_parameter(
             shape=self.weight_shape,
@@ -73,7 +79,7 @@ class UnquantizedLinearMethod(QuantMethodBase):
         )
 
     def process_weights_after_loading(self, layer):
-        if self.model_format == "torch":
+        if self.model_format == "torch" and not getattr(layer, "_weight_shape_is_format_agnostic", False):
             process_weight_transpose(layer, "weight")
 
     def process_loaded_weights(self, layer, weights) -> None:
@@ -171,10 +177,16 @@ class LinearBase(nn.Layer):
             self.weight_dtype = self._dtype
         else:
             self.weight_dtype = self._dtype
-        self.weight_shape = [
-            self.input_size,
-            self.output_size,
-        ]
+        # Support custom weight_shape for different matmul layouts
+        # Default: [input_size, output_size] = [k, n] for [m, k] * [k, n]
+        # Custom: [output_size, input_size] = [n, k] for [m, k] * [n, k]^T
+        if hasattr(self, "_custom_weight_shape"):
+            self.weight_shape = self._custom_weight_shape
+        else:
+            self.weight_shape = [
+                self.input_size,
+                self.output_size,
+            ]
 
         if (
             fd_config.quant_config
@@ -303,6 +315,13 @@ class ReplicatedLinear(LinearBase):
             with_bias (bool): Whether to include bias or not. Defaults to False.
             skip_quant (bool): Whether to skip quantization. Defaults to False.
         """
+        # Override weight_shape to [output_size, input_size] = [n, k] format
+        # for [m, k] * [n, k]^T matmul layout. No TP so no division.
+        self._custom_weight_shape = [output_size, input_size]
+        # Weight layout is already [n, k] regardless of checkpoint model_format,
+        # so UnquantizedLinearMethod.create_weights should not reverse it for torch.
+        self._weight_shape_is_format_agnostic = True
+
         super().__init__(
             fd_config=fd_config,
             prefix=prefix,
@@ -324,6 +343,72 @@ class ReplicatedLinear(LinearBase):
             ),
             model_format=fd_config.model_config.model_format if model_format is None else model_format,
         )
+
+    def forward_cuda(self, x: paddle.Tensor) -> paddle.Tensor:
+        """
+        Forward function for ReplicatedLinear.
+
+        Weight format is [n, k] = [output_size, input_size].
+        For [m, k] * [n, k]^T layout: x @ weight.T = [m, n].
+        """
+        if not isinstance(self.quant_method, UnquantizedLinearMethod):
+            if self.weight_dtype == "float32":
+                return self.quant_method.apply(self, x.cast("float32"))
+            return self.quant_method.apply(self, x)
+
+        if self.weight_dtype == "float32":
+            x = x.cast("float32")
+        out = paddle.matmul(x, self.weight, transpose_y=True)
+        if self.with_bias:
+            out = out + self.bias
+        return out
+
+    def weight_loader(self, param, loaded_weight, loaded_shard_id: Optional[str] = None):
+        # Weight format is [n, k] = [output_size, input_size]; no TP splitting.
+        weight_need_transpose = getattr(param, "weight_need_transpose", False)
+        if weight_need_transpose:
+            loaded_weight = get_tensor(loaded_weight)
+            loaded_weight = loaded_weight.transpose([1, 0])
+        # Normalize [k, n] -> [n, k] if needed.
+        if loaded_weight.shape[0] == self.input_size and loaded_weight.shape[-1] != self.input_size:
+            loaded_weight = get_tensor(loaded_weight)
+            loaded_weight = loaded_weight.transpose([1, 0])
+
+        if not param._is_initialized():
+            param.initialize()
+        if hasattr(param, "tensor_track"):
+            param.tensor_track.mark(start=0, end=loaded_weight.shape[0])
+
+        assert param.shape == loaded_weight.shape, (
+            f" Attempted to load weight ({loaded_weight.shape}) " f"into parameter ({param.shape})"
+        )
+        if loaded_weight.dtype != param.dtype:
+            if loaded_weight.dtype == paddle.int8 and param.dtype == paddle.float8_e4m3fn:
+                loaded_weight = loaded_weight.view(param.dtype)
+            else:
+                loaded_weight = loaded_weight.cast(param.dtype)
+        h2d_copy(param, loaded_weight)
+
+    def load_weight(self, state_dict: dict):
+        """
+        Load the weight from the state dictionary. Transpose [k, n] -> [n, k] if needed.
+        """
+        if "qkv_a_proj_with_mqa" in self.weight_key:
+            self.weight_key_q = self.weight_key.replace("qkv_a_proj_with_mqa", "q_a_proj")
+            self.weight_key_kv = self.weight_key.replace("qkv_a_proj_with_mqa", "kv_a_proj_with_mqa")
+            q_weight_tensor = get_tensor(state_dict.pop(self.weight_key_q))
+            kv_weight_tensor = get_tensor(state_dict.pop(self.weight_key_kv))
+            # Normalize each to [n, k] before concatenating along axis=0.
+            if q_weight_tensor.shape[0] == self.input_size:
+                q_weight_tensor = q_weight_tensor.transpose([1, 0])
+            if kv_weight_tensor.shape[0] == self.input_size:
+                kv_weight_tensor = kv_weight_tensor.transpose([1, 0])
+            weight_tensor = paddle.concat([q_weight_tensor, kv_weight_tensor], axis=0)
+        else:
+            weight_tensor = get_tensor(state_dict.pop(self.weight_key))
+            if weight_tensor.shape[0] == self.input_size:
+                weight_tensor = weight_tensor.transpose([1, 0])
+        self.quant_method.process_loaded_weights(self, weight_tensor)
 
 
 class MergedReplicatedLinear(ReplicatedLinear):
@@ -366,28 +451,25 @@ class MergedReplicatedLinear(ReplicatedLinear):
         self.output_sizes = output_sizes
 
     def weight_loader(self, param, loaded_weight, loaded_shard_id: Optional[str] = None):
+        # Weight format is [n, k] = [output_size, input_size]. No TP.
         if not param._is_initialized():
             param.initialize()
         # for xpu and other backend
         weight_need_transpose = getattr(param, "weight_need_transpose", False)
+        if weight_need_transpose:
+            loaded_weight = get_tensor(loaded_weight)
+            loaded_weight = loaded_weight.transpose([1, 0])
+        # Normalize [k, n] -> [n, k] if needed.
+        if loaded_weight.shape[0] == self.input_size and loaded_weight.shape[-1] != self.input_size:
+            loaded_weight = get_tensor(loaded_weight)
+            loaded_weight = loaded_weight.transpose([1, 0])
+
         if loaded_shard_id is None:
-            if weight_need_transpose:
-                loaded_weight = get_tensor(loaded_weight)
-                loaded_weight = loaded_weight.transpose([1, 0])
-                axis = -1
-            else:
-                axis = -1 if (self.fd_config.model_config.model_format == "torch") ^ True else 0
             if hasattr(param, "tensor_track"):
-                param.tensor_track.mark(start=0, end=loaded_weight.shape[axis])
+                param.tensor_track.mark(start=0, end=loaded_weight.shape[0])
 
         else:
             assert loaded_shard_id in ["q_a", "kv_a", "gate", "up"]
-            if weight_need_transpose:
-                loaded_weight = get_tensor(loaded_weight)
-                loaded_weight = loaded_weight.transpose([1, 0])
-                param_dim = True
-            else:
-                param_dim = (self.fd_config.model_config.model_format == "torch") ^ True
             if loaded_shard_id in ["q_a", "gate"]:
                 param_shard_offset = 0
                 param_shard_size = self.output_sizes[0]
@@ -397,9 +479,10 @@ class MergedReplicatedLinear(ReplicatedLinear):
 
             if hasattr(param, "tensor_track"):
                 param.tensor_track.mark(start=param_shard_offset, end=param_shard_offset + param_shard_size)
+            # For [n, k] format, slice on axis=0 (param_dim=False).
             param = slice_fn(
                 param,
-                param_dim,
+                False,
                 start=param_shard_offset,
                 end=param_shard_offset + param_shard_size,
             )
@@ -527,6 +610,13 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         self.output_size = output_size
         self.local_rank = fd_config.parallel_config.tensor_parallel_rank
 
+        # Override weight_shape to [output_size, input_size] = [n, k] format
+        # for [m, k] * [n, k]^T matmul layout.
+        self._custom_weight_shape = [output_size // self.tp_size, input_size]
+        # Weight layout is already [n, k] regardless of checkpoint model_format,
+        # so UnquantizedLinearMethod.create_weights should not reverse it for torch.
+        self._weight_shape_is_format_agnostic = True
+
         super().__init__(
             fd_config=fd_config,
             prefix=prefix,
@@ -537,11 +627,15 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         )
 
     def weight_loader(self, param, loaded_weight, loaded_shard_id: Optional[str] = None):
+        # Weight format is [n, k] = [output_size, input_size]
+        # TP splits along output_dim (axis=0 for [n, k] format)
         # for xpu and other backend
         weight_need_transpose = getattr(param, "weight_need_transpose", False)
         output_dim = getattr(param, "output_dim", None)
         assert output_dim is not None
-        shard_dim = -1 if output_dim else 0
+        # For [n, k] format: output is on axis=0 regardless of the toggled
+        # output_dim value produced by UnquantizedLinearMethod.create_weights.
+        shard_dim = 0
         output_size = param.shape[shard_dim]
         if loaded_shard_id is None:
             if weight_need_transpose:
@@ -556,9 +650,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 ("up", output_size * self.tp_size // 2, output_size * self.tp_size // 2),
             ]
             for shard_id, shard_offset, shard_size in shard_offsets:
-                loaded_weight_shard = slice_fn(
-                    loaded_weight, output_dim, start=shard_offset, end=shard_offset + shard_size
-                )
+                # For [n, k] format, slice on axis=0
+                loaded_weight_shard = slice_fn(loaded_weight, False, start=shard_offset, end=shard_offset + shard_size)
                 self.weight_loader(param, loaded_weight_shard, shard_id)
         else:
             # split gate up
@@ -566,9 +659,9 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             if weight_need_transpose:
                 loaded_weight = get_tensor(loaded_weight)
                 loaded_weight = loaded_weight.transpose([1, 0])
-            # Tensor parallelism splits the weight along the output_dim
-            if self.tp_size > 1 and output_dim is not None and not self.fd_config.load_config.is_pre_sharded:
-                dim = -1 if output_dim else 0
+            # Tensor parallelism splits the weight along axis=0 for [n, k] layout
+            if self.tp_size > 1 and not self.fd_config.load_config.is_pre_sharded:
+                dim = 0
                 if isinstance(loaded_weight, (np.ndarray, paddle.Tensor)):
                     size = loaded_weight.shape[dim]
                 else:
@@ -576,7 +669,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 block_size = size // self.tp_size
                 shard_offset = self.local_rank * block_size
                 shard_size = (self.local_rank + 1) * block_size
-                loaded_weight = slice_fn(loaded_weight, output_dim, start=shard_offset, end=shard_size)
+                # For [n, k] format, slice on axis=0
+                loaded_weight = slice_fn(loaded_weight, False, start=shard_offset, end=shard_size)
             if not param._is_initialized():
                 param.initialize()
             param_shard_size = output_size // 2
@@ -587,7 +681,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 param_shard_offset = param_shard_size
             if hasattr(param, "tensor_track"):
                 param.tensor_track.mark(start=param_shard_offset, end=param_shard_offset + param_shard_size)
-            param = slice_fn(param, output_dim, start=param_shard_offset, end=param_shard_offset + param_shard_size)
+            # For [n, k] format, slice on axis=0
+            param = slice_fn(param, False, start=param_shard_offset, end=param_shard_offset + param_shard_size)
             assert param.shape == loaded_weight.shape, (
                 f" Attempted to load weight ({loaded_weight.shape}) " f"into parameter ({param.shape})"
             )
@@ -600,6 +695,22 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 
             h2d_copy(param, loaded_weight)
 
+    def forward_cuda(self, x: paddle.Tensor) -> paddle.Tensor:
+        """
+        Forward function for MergedColumnParallelLinear.
+
+        Weight format is [n, k] = [output_size, input_size].
+        For [m, k] * [n, k]^T layout: x @ weight.T = [m, n].
+        """
+        if self.weight_dtype == "float32":
+            x = x.cast("float32")
+
+        out = paddle.matmul(x, self.weight, transpose_y=True)
+        if self.with_bias:
+            out = out + self.bias
+
+        return out
+
     def load_state_dict(self, state_dict: dict):
         """
         Load the checkpoint state dictionary into the layer.
@@ -611,12 +722,21 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         assert self.weight_key is not None, "weight_key should not be None."
         if self.weight_key in state_dict.keys():
             weight_tensor = get_tensor(state_dict.pop(self.weight_key))
+            # Ensure weight is in [n, k] format. Disk [k, n] (paddle) has
+            # shape[0] == input_size and needs a transpose.
+            if weight_tensor.shape[0] == self.input_size:
+                weight_tensor = weight_tensor.transpose([1, 0])
         else:
             gate_weight_key = self.weight_key.replace("up_gate_proj", "gate_proj")
             up_weight_key = self.weight_key.replace("up_gate_proj", "up_proj")
             gate_tensor = get_tensor(state_dict.pop(gate_weight_key))
             up_tensor = get_tensor(state_dict.pop(up_weight_key))
-            weight_tensor = paddle.concat([gate_tensor, up_tensor], axis=-1)
+            # Normalize each to [n, k] before concatenating along axis=0.
+            if gate_tensor.shape[0] == self.input_size:
+                gate_tensor = gate_tensor.transpose([1, 0])
+            if up_tensor.shape[0] == self.input_size:
+                up_tensor = up_tensor.transpose([1, 0])
+            weight_tensor = paddle.concat([gate_tensor, up_tensor], axis=0)
 
             if self.with_bias:
                 gate_bias_key = self.bias_key.replace("up_gate_proj", "gate_proj")
@@ -675,6 +795,14 @@ class QKVParallelLinear(ColumnParallelLinear):
             self.num_kv_head_replicas = 1
             output_size = (self.num_heads + 2 * self.kv_num_heads) * self.head_dim
         input_size = self.hidden_size
+
+        # Override weight_shape to [output_size, input_size] = [n, k] format
+        # for [m, k] * [n, k]^T matmul layout
+        self._custom_weight_shape = [output_size // self.tp_size, input_size]
+        # Weight layout is already [n, k] regardless of checkpoint model_format,
+        # so UnquantizedLinearMethod.create_weights should not reverse it for torch.
+        self._weight_shape_is_format_agnostic = True
+
         super().__init__(
             fd_config=fd_config,
             prefix=prefix,
@@ -694,9 +822,13 @@ class QKVParallelLinear(ColumnParallelLinear):
         return shard_size_mapping.get(loaded_shard_id)
 
     def weight_loader(self, param, loaded_weight, loaded_shard_id: Optional[str] = None):
+        # Weight format is [n, k] = [output_size, input_size]
+        # TP splits along output_dim (axis=0 for [n, k] format)
         output_dim = getattr(param, "output_dim", None)
         assert output_dim is not None
-        dim = -1 if output_dim else 0
+        # For [n, k] format: output is on axis=0, input is on axis=1
+        # We need to slice along axis=0 for q/k/v split
+        dim = 0  # Always use axis=0 for [n, k] format
         head_dim = param.shape[dim] // (self.num_heads_per_rank + 2 * self.kv_num_heads_per_rank)
         weight_need_transpose = getattr(param, "weight_need_transpose", False)
         if loaded_shard_id is None:
@@ -713,9 +845,8 @@ class QKVParallelLinear(ColumnParallelLinear):
                 ("v", (self.num_heads + self.kv_num_heads) * head_dim, self.kv_num_heads * head_dim),
             ]
             for shard_id, shard_offset, shard_size in shard_offsets:
-                loaded_weight_shard = slice_fn(
-                    loaded_weight, output_dim, start=shard_offset, end=shard_offset + shard_size
-                )
+                # For [n, k] format, use output_dim=False (slice on axis=0)
+                loaded_weight_shard = slice_fn(loaded_weight, False, start=shard_offset, end=shard_offset + shard_size)
                 self.weight_loader(param, loaded_weight_shard, shard_id)
         else:
             # split q k v
@@ -729,7 +860,8 @@ class QKVParallelLinear(ColumnParallelLinear):
                 shard_id = self.local_rank if loaded_shard_id == "q" else self.local_rank // self.num_kv_head_replicas
                 shard_offset = shard_id * block_size
                 shard_size = block_size
-                loaded_weight = slice_fn(loaded_weight, output_dim, start=shard_offset, end=shard_offset + shard_size)
+                # For [n, k] format, use output_dim=False (slice on axis=0)
+                loaded_weight = slice_fn(loaded_weight, False, start=shard_offset, end=shard_offset + shard_size)
 
             if not param._is_initialized():
                 param.initialize()
@@ -748,7 +880,8 @@ class QKVParallelLinear(ColumnParallelLinear):
             if hasattr(param, "tensor_track"):
                 param.tensor_track.mark(start=param_shard_offset, end=param_shard_offset + param_shard_size)
 
-            param = slice_fn(param, output_dim, start=param_shard_offset, end=param_shard_offset + param_shard_size)
+            # For [n, k] format, use output_dim=False (slice on axis=0)
+            param = slice_fn(param, False, start=param_shard_offset, end=param_shard_offset + param_shard_size)
             assert param.shape == loaded_weight.shape, (
                 f" Attempted to load weight ({loaded_weight.shape}) " f"into parameter ({param.shape})"
             )
@@ -769,6 +902,10 @@ class QKVParallelLinear(ColumnParallelLinear):
         """
         if self.weight_key in state_dict.keys():
             weight_tensor = get_tensor(state_dict.pop(self.weight_key))
+            # Check if weight is [k, n] format, transpose to [n, k]
+            if weight_tensor.shape[0] == self.hidden_size:
+                # weight is [k, n] format, transpose to [n, k]
+                weight_tensor = weight_tensor.transpose([1, 0])
         else:
             q_weight_key = self.weight_key.replace("qkv_proj", "q_proj")
             k_weight_key = self.weight_key.replace("qkv_proj", "k_proj")
@@ -785,14 +922,19 @@ class QKVParallelLinear(ColumnParallelLinear):
                 sharedkv_end = sharedkv_start + self.head_dim
                 k_tensor = k_tensor[:, sharedkv_start:sharedkv_end]
                 v_tensor = v_tensor[:, sharedkv_start:sharedkv_end]
-            weight_tensor = paddle.concat([q_tensor, k_tensor, v_tensor], axis=-1).transpose([1, 0])
+
+            # Assume loaded weights are [k, n] format, transpose to [n, k] then concat on axis=0
+            # Result: [n_q + n_k + n_v, k] = [(num_heads + 2*kv_num_heads) * head_dim, hidden_size]
+            q_tensor = q_tensor.transpose([1, 0])
+            k_tensor = k_tensor.transpose([1, 0])
+            v_tensor = v_tensor.transpose([1, 0])
+            weight_tensor = paddle.concat([q_tensor, k_tensor, v_tensor], axis=0)
             weight_tensor = weight_tensor.reshape(
                 [
-                    (self.num_heads_per_rank + 2 * self.kv_num_heads_per_rank) * (self.head_dim),
+                    (self.num_heads_per_rank + 2 * self.kv_num_heads_per_rank) * self.head_dim,
                     self.hidden_size,
                 ]
             )
-            weight_tensor = paddle.transpose(weight_tensor, perm=[1, 0])
 
         self.quant_method.process_loaded_weights(self, weight_tensor)
 
@@ -826,6 +968,27 @@ class QKVParallelLinear(ColumnParallelLinear):
                 v_bias = get_tensor(state_dict.pop(v_bias_key))
                 qkv_bias = paddle.concat([q_bias, k_bias, v_bias], axis=-1)
                 self.bias.set_value(qkv_bias)
+
+    def forward_cuda(self, x: paddle.Tensor) -> paddle.Tensor:
+        """
+        Forward function for QKVParallelLinear.
+
+        Args:
+            x (Tensor): Input tensor with shape [m, k].
+
+        Returns:
+            Tensor: Output tensor with shape [m, n].
+        """
+        # Weight format is [n, k] = [output_size, input_size]
+        # For [m, k] * [n, k]^T layout: x @ weight.T = [m, n]
+        if self.weight_dtype == "float32":
+            x = x.cast("float32")
+
+        out = paddle.matmul(x, self.weight, transpose_y=True)
+        if self.with_bias:
+            out += self.bias
+
+        return out
 
 
 class RowParallelLinear(LinearBase):
@@ -896,6 +1059,13 @@ class RowParallelLinear(LinearBase):
             self.input_size = divide(input_size, self.tp_size)
         self.output_size = output_size
 
+        # Override weight_shape to [output_size, input_size] = [n, k] format
+        # for [m, k] * [n, k]^T matmul layout.
+        self._custom_weight_shape = [self.output_size, self.input_size]
+        # Weight layout is already [n, k] regardless of checkpoint model_format,
+        # so UnquantizedLinearMethod.create_weights should not reverse it for torch.
+        self._weight_shape_is_format_agnostic = True
+
         super().__init__(
             fd_config=fd_config,
             prefix=prefix,
@@ -910,13 +1080,12 @@ class RowParallelLinear(LinearBase):
         create_weight_kwargs = dict(
             layer=self,
             output_dim=None if self.split_token else False,
-            weight_loader=(
-                self.weight_loader if hasattr(self, "weight_loader") else default_weight_loader(self.fd_config)
-            ),
+            weight_loader=self.weight_loader,
             model_format=fd_config.model_config.model_format,
         )
         if self.tp_size > 1:
-            create_weight_kwargs["split_axis"] = 0
+            # k dimension lives on axis=1 under the [n, k] layout.
+            create_weight_kwargs["split_axis"] = 1
             create_weight_kwargs["is_distributed"] = True
         self.quant_method.create_weights(**create_weight_kwargs)
 
@@ -924,6 +1093,67 @@ class RowParallelLinear(LinearBase):
 
         if self.with_bias and self.tp_size > 1 and self.reduce_results:
             set_weight_attrs(self.bias, {"tp_row_bias": True})
+
+    def weight_loader(self, param, loaded_weight, loaded_shard_id: Optional[str] = None):
+        # Weight format is [n, k] = [output_size, input_size]
+        # TP splits along input_dim (axis=1 for [n, k] format).
+        weight_need_transpose = getattr(param, "weight_need_transpose", False)
+        if weight_need_transpose:
+            loaded_weight = get_tensor(loaded_weight)
+            loaded_weight = loaded_weight.transpose([1, 0])
+
+        # 1D bias: no TP split; only handle tp_row_bias averaging and dtype.
+        is_bias = (
+            loaded_weight.ndim == 1
+            if hasattr(loaded_weight, "ndim")
+            else (len(getattr(loaded_weight, "shape", [])) == 1)
+        )
+
+        if not is_bias and self.tp_size > 1 and not self.fd_config.load_config.is_pre_sharded and not self.split_token:
+            dim = 1
+            if isinstance(loaded_weight, paddle.Tensor):
+                size = loaded_weight.shape[dim]
+            else:
+                size = loaded_weight.get_shape()[dim]
+            block_size = size // self.tp_size
+            shard_offset = self.fd_config.parallel_config.tensor_parallel_rank * block_size
+            shard_end = shard_offset + block_size
+            # For [n, k] format, slice on axis=1 (output_dim=True in slice_fn).
+            loaded_weight = slice_fn(loaded_weight, True, start=shard_offset, end=shard_end)
+
+        tp_row_bias = getattr(param, "tp_row_bias", None)
+        if tp_row_bias:
+            loaded_weight = loaded_weight / self.tp_size
+
+        if not param._is_initialized():
+            param.initialize()
+
+        # Ensure loaded weight dtype matches model param dtype
+        if loaded_weight.dtype != param.dtype:
+            if loaded_weight.dtype == paddle.int8 and param.dtype == paddle.float8_e4m3fn:
+                loaded_weight = loaded_weight.view(param.dtype)
+            else:
+                loaded_weight = loaded_weight.cast(param.dtype)
+
+        loaded_weight = get_tensor(loaded_weight)
+        assert (
+            param.shape == loaded_weight.shape
+        ), f" Attempted to load weight ({loaded_weight.shape}) into parameter ({param.shape})"
+        h2d_copy(param, loaded_weight)
+
+    def load_weight(self, state_dict: dict):
+        """
+        Load the weight from the state dictionary.
+
+        Args:
+            state_dict (dict): A dictionary containing the weights.
+        """
+        weight_tensor = get_tensor(state_dict.pop(self.weight_key))
+        # Disk weight may be [k, n] (paddle) or [n, k] (torch).
+        # Target layout is [n, k/tp]; the first dim must equal output_size.
+        if weight_tensor.shape[0] != self.output_size:
+            weight_tensor = weight_tensor.transpose([1, 0])
+        self.quant_method.process_loaded_weights(self, weight_tensor)
 
     def all2all_transpose(self, x: paddle.Tensor) -> paddle.Tensor:
         token_num = x.shape[0]
@@ -952,7 +1182,14 @@ class RowParallelLinear(LinearBase):
         if self.split_token:
             x = self.all2all_transpose(x)
 
-        out = self.quant_method.apply(self, x)
+        # Weight format is [n, k] = [output_size, input_size]
+        # For [m, k] * [n, k]^T layout: x @ weight.T = [m, n]
+        if self.weight_dtype == "float32":
+            x = x.cast("float32")
+
+        out = paddle.matmul(x, self.weight, transpose_y=True)
+        if self.with_bias:
+            out = out + self.bias
 
         need_tp_all_reduce = (
             self.reduce_results and self.tp_size > 1 and not (self.enable_all_reduce_fusion and out.shape[0] <= 2048)

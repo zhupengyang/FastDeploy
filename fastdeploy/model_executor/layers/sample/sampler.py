@@ -38,7 +38,6 @@ from fastdeploy.model_executor.layers.sample.logprobs import (
 )
 from fastdeploy.model_executor.layers.sample.meta_data import SamplingMetadata
 from fastdeploy.model_executor.layers.sample.ops import (
-    apply_penalty_multi_scores,
     apply_speculative_penalty_multi_scores,
     min_p_sampling,
     reasoning_phase_token_constraint,
@@ -522,24 +521,24 @@ class Sampler(nn.Layer):
             elif self.logprobs_mode == "raw_logits":
                 raw_logprobs = logits.clone()
 
-        for proc in sampling_metadata.logits_processors or []:
-            logits = proc.apply(logits)
+        # for proc in sampling_metadata.logits_processors or []:
+        #     logits = proc.apply(logits)
 
-        logits = apply_penalty_multi_scores(
-            sampling_metadata.token_ids_all,
-            logits,
-            sampling_metadata.repetition_penalties,
-            sampling_metadata.frequency_penalties,
-            sampling_metadata.presence_penalties,
-            sampling_metadata.temperature,
-            sampling_metadata.bad_words_token_ids,
-            sampling_metadata.bad_words_token_len,
-            sampling_metadata.prompt_lens,
-            sampling_metadata.step_idx,
-            sampling_metadata.min_dec_lens,
-            sampling_metadata.eos_token_ids,
-            sampling_metadata.pre_token_ids,
-        )
+        # logits = apply_penalty_multi_scores(
+        #     sampling_metadata.token_ids_all,
+        #     logits,
+        #     sampling_metadata.repetition_penalties,
+        #     sampling_metadata.frequency_penalties,
+        #     sampling_metadata.presence_penalties,
+        #     sampling_metadata.temperature,
+        #     sampling_metadata.bad_words_token_ids,
+        #     sampling_metadata.bad_words_token_len,
+        #     sampling_metadata.prompt_lens,
+        #     sampling_metadata.step_idx,
+        #     sampling_metadata.min_dec_lens,
+        #     sampling_metadata.eos_token_ids,
+        #     sampling_metadata.pre_token_ids,
+        # )
 
         if num_logprobs is not None:
             if self.logprobs_mode == "processed_logprobs":
@@ -548,6 +547,12 @@ class Sampler(nn.Layer):
                 raw_logprobs = logits.clone()
 
         probs = F.softmax(logits)
+
+        if getattr(sampling_metadata, "need_print", False):
+            # 打印probs第一行排序后的top5值和相应的id
+            if probs.shape[0] > 0:
+                top5_values, top5_indices = paddle.topk(probs[0], k=5)
+                logger.info(f"Top 5 probs for first row: values={top5_values.numpy()}, ids={top5_indices.numpy()}")
 
         # Record post-penalty logits and probs MD5 for determinism diagnosis
         if envs.FD_DETERMINISTIC_LOG_MODE:

@@ -25,6 +25,10 @@ from fastdeploy.platforms import current_platform
 
 if current_platform.is_gcu():
     from fastdeploy.model_executor.ops.gcu import fused_add_rms_norm, rms_norm
+elif current_platform.is_xpu():
+    from paddle.incubate.nn.functional import fused_layer_norm
+
+    from fastdeploy.model_executor.ops.xpu import fused_rms_norm_xpu
 else:
     from paddle.incubate.nn.functional import fused_layer_norm, fused_rms_norm
 
@@ -85,6 +89,8 @@ class RMSNorm(nn.Layer):
         self.eps: float = eps
         if current_platform.is_gcu():
             self.norm_func: Callable = fused_add_rms_norm
+        elif current_platform.is_xpu():
+            self.norm_func: Callable = fused_rms_norm_xpu
         else:
             self.norm_func: Callable = fused_rms_norm
         self.bias: Optional[paddle.Tensor] = bias
@@ -258,6 +264,8 @@ class RMSNorm(nn.Layer):
                         x = x + residual_input
                     norm_out = rms_norm_batch_invariant(x, self.weight, self.eps), x
                 else:
+                    if residual_input is not None:
+                        x = x + residual_input
                     norm_out = self.norm_func(
                         x,
                         norm_weight=self.weight,
@@ -265,12 +273,13 @@ class RMSNorm(nn.Layer):
                         epsilon=self.eps,
                         begin_norm_axis=self.begin_norm_axis,
                         bias=self.bias,
-                        residual=residual_input,
+                        residual=None,
                         quant_scale=(-1 if self.quant_scale is None else self.quant_scale),
                         quant_round_type=self.quant_round_type,
                         quant_max_bound=self.quant_max_bound,
                         quant_min_bound=self.quant_min_bound,
                     )
+                    norm_out[1] = x
         else:
             if residual_input is not None:
                 x = x + residual_input

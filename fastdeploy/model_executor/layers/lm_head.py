@@ -20,6 +20,7 @@ import numpy as np
 import paddle
 from paddle import nn
 from paddle.distributed import fleet
+from paddle.distributed.fleet.layers.mpu import mp_ops
 
 from fastdeploy.config import FDConfig
 from fastdeploy.model_executor.layers.utils import (
@@ -156,6 +157,14 @@ class ParallelLMHead(nn.Layer):
         Returns:
             Tensor: The output tensor after processing through the layer.
         """
-        logits = input.astype(self.linear.weight.dtype)
-        logits = self.linear(logits)
-        return logits
+        # self.linear.weight shape: [hidden_dim, vocab/tp]
+        w = self.linear.weight.astype(paddle.bfloat16).transpose([1, 0])
+        # w shape: [vocab/tp, hidden_dim], transpose_y makes it [hidden_dim, vocab/tp]
+        output_parallel = paddle.matmul(input, w, transpose_y=True)
+        if self.linear.bias is not None:
+            output_parallel = output_parallel + self.linear.bias
+        if self.need_gather and self.tp_size > 1:
+            output = mp_ops._c_concat(output_parallel, group=self.tp_group)
+        else:
+            output = output_parallel
+        return output

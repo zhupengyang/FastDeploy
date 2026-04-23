@@ -97,34 +97,32 @@ std::vector<paddle::Tensor> RmsNormKernel(
     add_out_data = out_data;
   }
 
-  bool use_sdnn = FLAGS_ENABLE_XVLLM_SDNN_INFER;
   if (residual_data) {
-    ret = infer_ops::add_rms_layer_norm<XPU_T, XPU_T>(xpu_ctx->x_context(),
-                                                      add_out_data,
-                                                      residual_data,
-                                                      out_data,
-                                                      m,
-                                                      n,
-                                                      epsilon,
-                                                      norm_weight_data,
-                                                      nullptr,
-                                                      nullptr,
-                                                      residual_out_data,
-                                                      nullptr,
-                                                      use_sdnn);
-    PD_CHECK(ret == 0, "add_rms_layer_norm");
+    ret = infer_ops::add_rms_layer_norm_with_stride<XPU_T, XPU_T>(
+        xpu_ctx->x_context(),
+        add_out_data,
+        out_data,
+        const_cast<XPU_T*>(residual_data),
+        residual_out_data,
+        m,
+        n,
+        n,
+        n,
+        epsilon,
+        norm_weight_data);
+    PD_CHECK(ret == 0, "add_rms_layer_norm_with_stride");
   } else {
-    ret = api::rms_layer_norm<XPU_T, XPU_T>(xpu_ctx->x_context(),
-                                            add_out_data,
-                                            out_data,
-                                            m,
-                                            n,
-                                            epsilon,
-                                            norm_weight_data,
-                                            nullptr,
-                                            nullptr,
-                                            false);
-    PD_CHECK(ret == 0, "rms_layer_norm");
+    ret = infer_ops::rms_layer_norm_with_stride<XPU_T, XPU_T>(
+        xpu_ctx->x_context(),
+        add_out_data,
+        out_data,
+        m,
+        n,
+        n,
+        n,
+        epsilon,
+        norm_weight_data);
+    PD_CHECK(ret == 0, "rms_layer_norm_with_stride");
   }
 
   return {out, residual_out};

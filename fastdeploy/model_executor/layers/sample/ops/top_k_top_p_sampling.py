@@ -134,6 +134,8 @@ def top_k_top_p_sampling(
                     k=k,
                     mode="truncated",
                 )
+                # _, ids = paddle.topk(x, k=1, axis=-1)
+                # ids = ids.astype("int64")
     return _, ids
 
 

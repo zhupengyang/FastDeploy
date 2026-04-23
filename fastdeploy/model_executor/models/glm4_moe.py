@@ -533,7 +533,7 @@ class Glm4MoeForCausalLM(ModelForCasualLM):
         """ """
         logits = self.lm_head(hidden_states)
         logits = logits.astype(paddle.float32)
-        logits[:, self.ori_vocab_size :] = -float("inf")
+        # logits[:, self.ori_vocab_size :] = -float("inf")
 
         return logits
 

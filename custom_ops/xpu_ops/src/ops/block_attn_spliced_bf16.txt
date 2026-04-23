@@ -279,7 +279,7 @@ void split_kvcache_encoder(api::Context* xpu_ctx,
           xpu_ctx,
           reinterpret_cast<const TQKV*>(q_split.data()),
           reinterpret_cast<const TQKV*>(k_split.data()),
-          reinterpret_cast<const float*>(rotary_embs.data<float>()),
+          reinterpret_cast<const TQKV*>(rotary_embs.data()),
           const_cast<TQKV*>(reinterpret_cast<const TQKV*>(q.data())),
           const_cast<TQKV*>(reinterpret_cast<const TQKV*>(k.data())),
           seq_lod,
@@ -298,7 +298,7 @@ void split_kvcache_encoder(api::Context* xpu_ctx,
           xpu_ctx,
           reinterpret_cast<const TQKV*>(q_split.data()),
           reinterpret_cast<const TQKV*>(k_split.data()),
-          reinterpret_cast<const float*>(rotary_embs.data<float>()),
+          reinterpret_cast<const TQKV*>(rotary_embs.data()),
           const_cast<TQKV*>(reinterpret_cast<const TQKV*>(q.data())),
           const_cast<TQKV*>(reinterpret_cast<const TQKV*>(k.data())),
           seq_lod,
@@ -418,11 +418,11 @@ void split_kvcache_encoder(api::Context* xpu_ctx,
     }
   } else {
     if (use_neox_rotary_style) {
-      ret = infer_ops::split_neox_cache_kv_encoder<TQKV, float, TKV_CACHE, int>(
+      ret = infer_ops::split_neox_cache_kv_encoder<TQKV, TQKV, TKV_CACHE, int>(
           xpu_ctx,
           reinterpret_cast<const TQKV*>(qkv.data()) + qkv_offset,  // qkv
-          reinterpret_cast<const float*>(
-              rotary_embs.data<float>()),  // rotary_pos_emb
+          reinterpret_cast<const TQKV*>(
+              rotary_embs.data()),  // rotary_pos_emb
           reinterpret_cast<const int*>(
               block_tables.data<int>()),  // block_table
           const_cast<TQKV*>(reinterpret_cast<const TQKV*>(q.data())),
@@ -596,7 +596,7 @@ void split_kvcache_decoder(api::Context* xpu_ctx,
           xpu_ctx,
           reinterpret_cast<const TQKV*>(q_split.data()),
           reinterpret_cast<const TQKV*>(k_split.data()),
-          reinterpret_cast<const float*>(rotary_embs.data<float>()),
+          reinterpret_cast<const TQKV*>(rotary_embs.data()),
           const_cast<TQKV*>(reinterpret_cast<const TQKV*>(q.data())),
           const_cast<TQKV*>(reinterpret_cast<const TQKV*>(k.data())),
           seq_lod,
@@ -615,7 +615,7 @@ void split_kvcache_decoder(api::Context* xpu_ctx,
           xpu_ctx,
           reinterpret_cast<const TQKV*>(q_split.data()),
           reinterpret_cast<const TQKV*>(k_split.data()),
-          reinterpret_cast<const float*>(rotary_embs.data<float>()),
+          reinterpret_cast<const TQKV*>(rotary_embs.data()),
           const_cast<TQKV*>(reinterpret_cast<const TQKV*>(q.data())),
           const_cast<TQKV*>(reinterpret_cast<const TQKV*>(k.data())),
           seq_lod,
@@ -753,11 +753,11 @@ void split_kvcache_decoder(api::Context* xpu_ctx,
   } else {
     if (use_neox_rotary_style) {
       ret = infer_ops::
-          split_neox_cache_kv_decoder<TQKV, float, TKV_CACHE, TSCALE, int>(
+          split_neox_cache_kv_decoder<TQKV, TQKV, TKV_CACHE, TSCALE, int>(
               xpu_ctx,
               reinterpret_cast<const TQKV*>(qkv.data()) + qkv_offset,  // qkv
-              reinterpret_cast<const float*>(
-                  rotary_embs.data<float>()),  // rotary_pos_emb
+              reinterpret_cast<const TQKV*>(
+                  rotary_embs.data()),  // rotary_pos_emb
               reinterpret_cast<const int*>(
                   block_tables.data<int>()),  // block_table
               const_cast<TQKV*>(reinterpret_cast<const TQKV*>(q.data())),
@@ -1007,7 +1007,7 @@ std::vector<paddle::Tensor> SplitEmbeddingKVCache(
         const_cast<int32_t*>(prefix_len.data<int32_t>())};
 
     // split, rotary embedding and write to kv cache
-    split_kvcache_encoder<XPU_XType, float, XPU_CType, int, E_Scale>(
+    split_kvcache_encoder<XPU_XType, XPU_XType, XPU_CType, int, E_Scale>(
         xpu_ctx,
         xctx,
         qkv,
@@ -1122,7 +1122,7 @@ std::vector<paddle::Tensor> SplitEmbeddingKVCache(
     // split, rotary embedding and write to kv cache
     if (total_dec_len != dec_batch) {
       // mtp branch
-      split_kvcache_encoder<XPU_XType, float, XPU_CType, int, E_Scale>(
+      split_kvcache_encoder<XPU_XType, XPU_XType, XPU_CType, int, E_Scale>(
           xpu_ctx,
           xctx,
           qkv,
@@ -1163,7 +1163,7 @@ std::vector<paddle::Tensor> SplitEmbeddingKVCache(
           use_neox_rotary_style);
     } else {
       // non mtp branch
-      split_kvcache_decoder<XPU_XType, float, XPU_CType, int, D_Scale>(
+      split_kvcache_decoder<XPU_XType, XPU_XType, XPU_CType, int, D_Scale>(
           xpu_ctx,
           xctx,
           qkv,
