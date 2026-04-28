@@ -15,11 +15,11 @@
 """Abstract base class for all data processors.
 
 Provides unified response-processing logic (ids2tokens, process_response_dict*,
-update_stop_seq, update_bad_words, pad_batch_data, …) shared by all concrete
-processors:
+update_stop_seq, update_bad_words, pad_batch_data, …) extracted from the two
+existing concrete processors:
 
-    TextProcessor       (fastdeploy/input/text_processor.py)
-    MultiModalProcessor (fastdeploy/input/multimodal_processor.py)
+    DataProcessor      (fastdeploy/input/text_processor.py)
+    Ernie4_5Processor  (fastdeploy/input/ernie4_5_processor.py)
 
 Key design decisions
 --------------------
@@ -28,12 +28,16 @@ Key design decisions
   of each subclass.  Subclasses that do not call ``super().__init__()`` must
   initialise those three attributes themselves.
 
-* ``process_response_dict`` reads ``stream`` from ``kwargs`` (default: True).
+* ``process_response_dict`` reads ``stream`` from ``kwargs`` (DataProcessor
+  convention).  Callers that previously passed ``stream`` as a positional
+  argument (ERNIE convention) must be updated to use ``stream=`` keyword.
 
-* EOS removal uses ``in self.eos_token_ids`` (list membership).
+* EOS removal uses ``in self.eos_token_ids`` (list membership).  ERNIE's
+  ``eos_token_ids`` contains exactly one element, so this is equivalent to the
+  ``==`` check it currently uses.
 
 * tool_parser result never updates ``outputs["text"]``; only ``tool_calls`` is
-  set.
+  set.  This matches DataProcessor behaviour.
 
 * ``ids2tokens`` always returns a three-tuple
   ``(delta_text, previous_token_ids, previous_texts)``.  The HF-tokeniser
